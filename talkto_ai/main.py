@@ -22,7 +22,7 @@ from rich.text import Text
 from .browser_agent import AgentState, BrowserAgent, StepResult
 from .config import config
 from .llm import close_client
-from .router import route_user_input
+from .router import answer_directly, route_user_input
 from .summarizer import summarize
 from .tts import play_audio, text_to_speech
 
@@ -88,10 +88,12 @@ async def _run_session(
             log.warning("Gagal routing intent: %s", exc)
             decision = None
 
-    # Jika percakapan santai / pertanyaan umum -> Langsung jawab tanpa browser
-    if decision and not decision.need_browser and decision.direct_reply:
-        answer = decision.direct_reply
-        console.print(Panel(answer, title="💬 Jawaban", border_style="cyan"))
+    # Jika tidak butuh browser (hal teknis, mekanik, coding, pengetahuan umum, obrolan) -> Dijawab langsung oleh AI
+    if decision and not decision.need_browser:
+        with console.status("[bold cyan]Menyiapkan jawaban...[/]"):
+            answer = await answer_directly(query)
+
+        console.print(Panel(answer, title="💬 Jawaban Langsung", border_style="cyan"))
 
         if with_audio:
             console.print("[bold cyan]🔊 Membuat audio...[/]")
