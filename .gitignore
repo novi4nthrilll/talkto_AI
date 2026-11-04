@@ -10,4 +10,6 @@ output/
 *.log
 .idea/
 .vscode/
-
+*.egg-info/
+build/
+dist/
