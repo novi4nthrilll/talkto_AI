@@ -6,6 +6,7 @@ Termasuk deteksi captcha dan mekanisme pause/resume.
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -33,6 +34,13 @@ _CAPTCHA_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"recaptcha", re.I),
     re.compile(r"cf-turnstile", re.I),
 ]
+
+# Selector gabungan — satu daftar untuk klik DAN type, supaya indeks konsisten
+_INTERACTIVE_SELECTOR = (
+    "a, button, input, textarea, select, "
+    "[role=button], [role=link], [role=textbox], "
+    "[contenteditable=true], input[type=submit]"
+)
 
 
 class AgentState(Enum):
@@ -69,7 +77,9 @@ def _clean_html(html: str, max_chars: int = 6000) -> str:
     soup = BeautifulSoup(html, "lxml")
 
     # Buang elemen yang tidak berguna
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "iframe"]):
+    for tag in soup(
+        ["script", "style", "nav", "footer", "header", "noscript", "svg", "iframe"]
+    ):
         tag.decompose()
 
     text = soup.get_text(separator="\n", strip=True)
@@ -86,23 +96,86 @@ def _detect_captcha(page_text: str, page_url: str) -> bool:
     return any(pat.search(combined) for pat in _CAPTCHA_PATTERNS)
 
 
-def _extract_clickable(html: str, max_items: int = 40) -> str:
-    """Ambil elemen yang bisa diklik (link, button) beserta teksnya."""
+def _extract_interactive_elements(html: str, max_items: int = 50) -> str:
+    """
+    Ambil SEMUA elemen interaktif (link, button, input, textarea, dll)
+    dengan satu selector dan satu set indeks — supaya konsisten
+    antara observe dan act.
+    """
     soup = BeautifulSoup(html, "lxml")
     items: list[str] = []
 
-    for i, el in enumerate(soup.select("a, button, input[type=submit], [role=button]")):
+    for i, el in enumerate(soup.select(_INTERACTIVE_SELECTOR)):
         if i >= max_items:
             break
-        tag = el.name
-        text = el.get_text(strip=True)[:80] or "(kosong)"
-        href = el.get("href", "")
-        if href:
-            items.append(f"[{i}] <{tag}> {text} → {href}")
-        else:
-            items.append(f"[{i}] <{tag}> {text}")
 
-    return "\n".join(items) if items else "(tidak ada elemen klik)"
+        tag = el.name
+        el_type = el.get("type", "")
+        text = el.get_text(strip=True)[:80] or ""
+        placeholder = el.get("placeholder", "")
+        href = el.get("href", "")
+        name = el.get("name", "")
+        aria_label = el.get("aria-label", "")
+        value = el.get("value", "")
+
+        # Bangun label yang informatif
+        label_parts: list[str] = []
+        if text:
+            label_parts.append(text)
+        elif placeholder:
+            label_parts.append(f'placeholder="{placeholder}"')
+        elif aria_label:
+            label_parts.append(f'aria-label="{aria_label}"')
+        elif value:
+            label_parts.append(f'value="{value}"')
+        elif name:
+            label_parts.append(f'name="{name}"')
+        else:
+            label_parts.append("(kosong)")
+
+        label = " ".join(label_parts)
+
+        # Tentukan tipe elemen
+        if tag in ("input", "textarea") or el.get("contenteditable") == "true":
+            kind = f"<{tag}" + (f' type="{el_type}"' if el_type else "") + ">"
+            items.append(f"[{i}] {kind} {label} [BISA DIKETIK]")
+        elif tag == "select":
+            items.append(f"[{i}] <select> {label} [DROPDOWN]")
+        elif href:
+            items.append(f"[{i}] <{tag}> {label} → {href}")
+        else:
+            items.append(f"[{i}] <{tag}> {label}")
+
+    return "\n".join(items) if items else "(tidak ada elemen interaktif)"
+
+
+def _trim_messages(
+    messages: list[dict[str, Any]],
+    *,
+    keep_system: int = 1,
+    keep_recent: int = 6,
+) -> list[dict[str, Any]]:
+    """
+    Batasi panjang history messages supaya tidak melebihi token limit.
+    Simpan system prompt + beberapa langkah terakhir.
+    """
+    system_msgs = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+
+    if len(non_system) <= keep_recent:
+        return messages
+
+    # Ambil pesan pertama (tujuan awal) + pesan terbaru
+    trimmed = system_msgs[:keep_system]
+    trimmed.append(non_system[0])  # Tujuan awal
+    trimmed.append(
+        {
+            "role": "user",
+            "content": f"[... {len(non_system) - keep_recent - 1} langkah sebelumnya diringkas ...]",
+        }
+    )
+    trimmed.extend(non_system[-keep_recent:])
+    return trimmed
 
 
 # ── System prompt untuk agent ───────────────────────────────
@@ -112,27 +185,29 @@ Kamu adalah browser agent. Tugasmu: navigasi web untuk mencapai tujuan user.
 Di setiap langkah kamu akan diberi:
 - URL halaman sekarang
 - Teks inti halaman
-- Daftar elemen yang bisa diklik (dengan indeks)
+- Daftar elemen interaktif (dengan indeks)
+  - Elemen bertanda [BISA DIKETIK] bisa diisi teks pakai `type`
+  - Elemen lain bisa diklik pakai `click`
 
 Jawab **hanya** dengan satu blok JSON (tanpa markdown fence):
 {
   "thought": "penjelasan singkat",
-  "action": "salah satu dari: goto <url> | click <indeks> | type <indeks> <teks> | scroll down | scroll up | extract | done",
+  "action": "salah satu dari: goto <url> | click <indeks> | type <indeks> <teks> | press_enter | scroll down | scroll up | extract | done",
   "extract": "teks penting yang kamu temukan (kosongkan jika belum ada)"
 }
 
 Aturan:
-- Gunakan `goto <url>` untuk membuka halaman baru.
-- Gunakan `click <indeks>` untuk klik elemen berdasarkan indeks.
-- Gunakan `type <indeks> <teks>` untuk mengetik di input field.
-- Gunakan `scroll down` atau `scroll up` untuk scroll.
-- Gunakan `extract` untuk mengambil informasi penting dari halaman.
-- Gunakan `done` kalau tujuan sudah tercapai atau info sudah cukup.
+- `goto <url>` — buka halaman baru.
+- `click <indeks>` — klik elemen berdasarkan indeks.
+- `type <indeks> <teks>` — ketik di elemen [BISA DIKETIK] berdasarkan indeks.
+- `press_enter` — tekan Enter (misal setelah mengetik query di search box).
+- `scroll down` / `scroll up` — scroll halaman.
+- `extract` — ambil informasi penting dari halaman saat ini.
+- `done` — tujuan tercapai atau info sudah cukup.
 - Selalu isi field `extract` jika menemukan informasi relevan.
 - Jangan pernah coba solve captcha sendiri.
+- Indeks elemen HARUS sesuai dengan daftar yang diberikan.
 """
-
-import json as _json
 
 
 def _parse_agent_response(text: str) -> dict[str, str]:
@@ -148,7 +223,10 @@ def _parse_agent_response(text: str) -> dict[str, str]:
         # Coba cari JSON di dalam teks
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
-            return _json.loads(match.group())
+            try:
+                return _json.loads(match.group())
+            except _json.JSONDecodeError:
+                pass
         return {"thought": text, "action": "done", "extract": ""}
 
 
@@ -195,11 +273,11 @@ class BrowserAgent:
         url = self._page.url
         html = await self._page.content()
         page_text = _clean_html(html)
-        clickable = _extract_clickable(html)
+        interactive = _extract_interactive_elements(html)
         return {
             "url": url,
             "page_text": page_text,
-            "clickable": clickable,
+            "interactive": interactive,
         }
 
     async def _take_screenshot(self) -> str:
@@ -220,33 +298,63 @@ class BrowserAgent:
             if not url.startswith("http"):
                 url = "https://" + url
             log.info("→ goto %s", url)
-            await self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            try:
+                await self._page.goto(
+                    url, wait_until="domcontentloaded", timeout=30_000
+                )
+            except Exception as exc:
+                log.warning("Gagal goto %s: %s", url, exc)
+                raise
 
         elif cmd == "click":
             idx = int(arg)
-            elements = await self._page.query_selector_all(
-                "a, button, input[type=submit], [role=button]"
-            )
+            elements = await self._page.query_selector_all(_INTERACTIVE_SELECTOR)
             if 0 <= idx < len(elements):
                 log.info("→ click [%d]", idx)
-                await elements[idx].click()
-                await self._page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                try:
+                    await elements[idx].scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass  # Kalau gagal scroll, tetap coba klik
+                await elements[idx].click(timeout=5000)
+                # Tunggu navigasi atau perubahan halaman
+                try:
+                    await self._page.wait_for_load_state(
+                        "domcontentloaded", timeout=10_000
+                    )
+                except Exception:
+                    await asyncio.sleep(1)
             else:
-                log.warning("Indeks klik %d di luar jangkauan (%d elemen)", idx, len(elements))
+                log.warning(
+                    "Indeks klik %d di luar jangkauan (%d elemen)", idx, len(elements)
+                )
 
         elif cmd == "type":
             # format: type <idx> <teks>
             type_parts = arg.split(maxsplit=1)
             idx = int(type_parts[0])
             text = type_parts[1] if len(type_parts) > 1 else ""
-            inputs = await self._page.query_selector_all(
-                "input, textarea, [contenteditable=true]"
-            )
-            if 0 <= idx < len(inputs):
+            # Pakai selector yang SAMA dengan observe
+            elements = await self._page.query_selector_all(_INTERACTIVE_SELECTOR)
+            if 0 <= idx < len(elements):
                 log.info("→ type [%d] '%s'", idx, text[:40])
-                await inputs[idx].fill(text)
+                try:
+                    await elements[idx].scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                await elements[idx].click(timeout=3000)
+                await elements[idx].fill(text)
             else:
-                log.warning("Indeks type %d di luar jangkauan", idx)
+                log.warning("Indeks type %d di luar jangkauan (%d elemen)", idx, len(elements))
+
+        elif cmd == "press_enter":
+            log.info("→ press Enter")
+            await self._page.keyboard.press("Enter")
+            try:
+                await self._page.wait_for_load_state(
+                    "domcontentloaded", timeout=15_000
+                )
+            except Exception:
+                await asyncio.sleep(1.5)
 
         elif cmd == "scroll":
             direction = arg.lower()
@@ -307,7 +415,9 @@ class BrowserAgent:
         try:
             await self.start()
             assert self._page is not None
-            await self._page.goto(start_url, wait_until="domcontentloaded", timeout=30_000)
+            await self._page.goto(
+                start_url, wait_until="domcontentloaded", timeout=30_000
+            )
 
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": _AGENT_SYSTEM},
@@ -333,14 +443,15 @@ class BrowserAgent:
                     f"Langkah {step_num}/{config.max_steps}\n"
                     f"URL: {obs['url']}\n\n"
                     f"=== Teks halaman ===\n{obs['page_text']}\n\n"
-                    f"=== Elemen klik ===\n{obs['clickable']}"
+                    f"=== Elemen interaktif ===\n{obs['interactive']}"
                 )
+
+                # Trim message history supaya tidak melebihi token limit
+                messages = _trim_messages(messages)
 
                 if use_vision:
                     screenshot_b64 = await self._take_screenshot()
-                    messages.append(
-                        build_user_message(obs_text, screenshot_b64)
-                    )
+                    messages.append(build_user_message(obs_text, screenshot_b64))
                 else:
                     messages.append({"role": "user", "content": obs_text})
 
@@ -367,7 +478,9 @@ class BrowserAgent:
 
                 log.info(
                     "[Langkah %d] thought=%s | action=%s",
-                    step_num, thought[:60], action,
+                    step_num,
+                    thought[:60],
+                    action,
                 )
 
                 # Kumpulkan teks yang di-extract
@@ -404,4 +517,3 @@ class BrowserAgent:
             await self.stop()
 
         return result
-

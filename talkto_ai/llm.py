@@ -17,6 +17,25 @@ log = logging.getLogger(__name__)
 # Timeout per request (detik)
 _TIMEOUT = 60.0
 
+# Shared client — dibuat sekali, dipakai berulang supaya koneksi di-reuse
+_client: httpx.AsyncClient | None = None
+
+
+async def _get_client() -> httpx.AsyncClient:
+    """Ambil atau buat shared async HTTP client."""
+    global _client
+    if _client is None or _client.is_closed:
+        _client = httpx.AsyncClient(timeout=_TIMEOUT)
+    return _client
+
+
+async def close_client() -> None:
+    """Tutup shared client. Panggil saat shutdown."""
+    global _client
+    if _client is not None and not _client.is_closed:
+        await _client.aclose()
+        _client = None
+
 
 class LLMError(Exception):
     """Gagal memanggil semua provider."""
@@ -42,10 +61,10 @@ async def _call_provider(
     }
     url = f"{provider.base_url}/chat/completions"
 
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    client = await _get_client()
+    resp = await client.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
 
     text: str = data["choices"][0]["message"]["content"]
     log.info("Provider %s → %d karakter", provider.name, len(text))
@@ -86,6 +105,28 @@ async def chat(
             return await _call_provider(
                 prov, messages, temperature=temperature, max_tokens=max_tokens
             )
+        except httpx.HTTPStatusError as exc:
+            msg = f"{prov.name}: HTTP {exc.response.status_code}"
+            log.warning("Gagal: %s", msg)
+            errors.append(msg)
+            # Retry sekali untuk error 429 (rate limit) dan 5xx
+            if exc.response.status_code in (429, 500, 502, 503):
+                import asyncio
+
+                wait = 3.0 if exc.response.status_code == 429 else 1.0
+                log.info("Retry %s setelah %.1f detik...", prov.name, wait)
+                await asyncio.sleep(wait)
+                try:
+                    return await _call_provider(
+                        prov,
+                        messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                except Exception as retry_exc:
+                    msg2 = f"{prov.name} (retry): {retry_exc}"
+                    log.warning("Retry gagal: %s", msg2)
+                    errors.append(msg2)
         except Exception as exc:
             msg = f"{prov.name}: {exc}"
             log.warning("Gagal: %s", msg)
@@ -120,4 +161,3 @@ def build_user_message(text: str, image_b64: str | None = None) -> dict:
 def encode_screenshot(raw_bytes: bytes) -> str:
     """Encode screenshot ke base64 string."""
     return base64.b64encode(raw_bytes).decode()
-

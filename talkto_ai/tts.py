@@ -5,6 +5,7 @@ Mendukung edge-tts dan gTTS.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -64,11 +65,14 @@ async def _tts_edge(text: str, output_path: Path, voice: str) -> Path:
 
 # ── Engine: gTTS ────────────────────────────────────────────
 async def _tts_gtts(text: str, output_path: Path, _voice: str) -> Path:
-    """Generate audio via gTTS (sync wrapper)."""
+    """Generate audio via gTTS — jalan di thread supaya tidak block event loop."""
     from gtts import gTTS
 
-    tts = gTTS(text=text, lang="id")
-    tts.save(str(output_path))
+    def _generate():
+        tts = gTTS(text=text, lang="id")
+        tts.save(str(output_path))
+
+    await asyncio.to_thread(_generate)
     log.info("gTTS → %s", output_path)
     return output_path
 
@@ -130,19 +134,34 @@ async def text_to_speech(
 
 def play_audio(path: Path) -> None:
     """Coba putar file audio. Kalau gagal, print path-nya saja."""
-    try:
-        if sys.platform == "linux":
+    players: list[list[str]] = []
+
+    if sys.platform == "linux":
+        # Coba player ringan dulu, baru fallback ke xdg-open
+        players = [
+            ["mpv", "--no-video", str(path)],
+            ["ffplay", "-nodisp", "-autoexit", str(path)],
+            ["aplay", str(path)],
+            ["xdg-open", str(path)],
+        ]
+    elif sys.platform == "darwin":
+        players = [["afplay", str(path)], ["open", str(path)]]
+    elif sys.platform == "win32":
+        players = [["start", "", str(path)]]
+
+    for cmd in players:
+        try:
             subprocess.Popen(
-                ["xdg-open", str(path)],
+                cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                shell=(sys.platform == "win32"),
             )
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(path)])
-        elif sys.platform == "win32":
-            subprocess.Popen(["start", "", str(path)], shell=True)
-        else:
-            log.info("Platform tidak dikenali, tidak bisa auto-play")
-    except Exception as exc:
-        log.warning("Gagal memutar audio: %s", exc)
+            return
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            log.warning("Gagal memutar dengan %s: %s", cmd[0], exc)
+            continue
 
+    log.info("Tidak ada audio player yang tersedia. File: %s", path)

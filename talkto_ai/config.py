@@ -4,11 +4,14 @@ Konfigurasi terpusat — memuat .env dan menyediakan setting default.
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+log = logging.getLogger(__name__)
 
 # Muat .env dari root project
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
@@ -77,6 +80,17 @@ def _build_providers() -> list[LLMProvider]:
     return providers
 
 
+def _parse_int(value: str, default: int, name: str) -> int:
+    """Parse integer dari env var dengan fallback dan warning."""
+    try:
+        return int(value)
+    except ValueError:
+        log.warning(
+            "Nilai '%s' untuk %s bukan angka, pakai default %d", value, name, default
+        )
+        return default
+
+
 # ── Setting utama ───────────────────────────────────────────
 @dataclass
 class Config:
@@ -86,7 +100,7 @@ class Config:
 
     # Browser
     browser_headless: bool = os.getenv("BROWSER_HEADLESS", "false").lower() == "true"
-    max_steps: int = int(os.getenv("MAX_STEPS", "15"))
+    max_steps: int = _parse_int(os.getenv("MAX_STEPS", "15"), 15, "MAX_STEPS")
 
     # TTS
     tts_engine: str = os.getenv("TTS_ENGINE", "edge-tts")
@@ -96,7 +110,9 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     # Output
-    output_dir: Path = Path(__file__).resolve().parent.parent / "output"
+    output_dir: Path = field(
+        default_factory=lambda: Path(__file__).resolve().parent.parent / "output"
+    )
 
     def available_providers(self, vision: bool = False) -> list[LLMProvider]:
         """Provider yang punya API key (dan opsional support vision)."""
@@ -108,4 +124,3 @@ class Config:
 
 
 config = Config()
-

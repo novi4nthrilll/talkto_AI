@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-import threading
 from datetime import datetime
 
 from rich.console import Console
@@ -20,6 +19,7 @@ from rich.text import Text
 
 from .browser_agent import AgentState, BrowserAgent, StepResult
 from .config import config
+from .llm import close_client
 from .summarizer import summarize
 from .tts import play_audio, text_to_speech
 
@@ -38,7 +38,9 @@ def _setup_logging() -> None:
 def _print_banner() -> None:
     banner = Text()
     banner.append("🤖 AI Web Agent", style="bold cyan")
-    banner.append("\n   Cari info di internet, jawab dengan teks & suara\n", style="dim")
+    banner.append(
+        "\n   Cari info di internet, jawab dengan teks & suara\n", style="dim"
+    )
     console.print(Panel(banner, border_style="cyan"))
 
 
@@ -57,33 +59,42 @@ def _on_captcha(message: str) -> None:
     console.print(f"\n[bold red]{message}[/bold red]\n")
 
 
+async def _wait_for_captcha_input(agent: BrowserAgent) -> None:
+    """
+    Tunggu input Enter dari user di thread terpisah saat captcha muncul.
+    Pakai asyncio.to_thread supaya tidak block event loop.
+    """
+    await asyncio.to_thread(input)
+    agent.resume_after_captcha()
+
+
 async def _run_session(query: str) -> None:
     """Jalankan satu sesi pencarian."""
     console.print(f"\n[bold green]🔍 Mencari:[/] {query}\n")
 
     agent = BrowserAgent()
 
-    # Thread untuk listen input captcha resume
-    def _captcha_listener():
-        while agent.state != AgentState.DONE and agent.state != AgentState.ERROR:
-            if agent.state == AgentState.PAUSED_CAPTCHA:
-                input()  # Tunggu Enter
-                agent.resume_after_captcha()
-                break
-            import time
-            time.sleep(0.5)
+    # Task untuk handle captcha input secara async
+    captcha_task: asyncio.Task | None = None
 
-    captcha_thread = threading.Thread(target=_captcha_listener, daemon=True)
-    captcha_thread.start()
+    def _captcha_handler(message: str) -> None:
+        nonlocal captcha_task
+        _on_captcha(message)
+        # Spawn async task untuk tunggu Enter, bukan thread biasa
+        captcha_task = asyncio.create_task(_wait_for_captcha_input(agent))
 
     # Jalankan agent
     use_vision = bool(config.available_providers(vision=True))
     result = await agent.run(
         goal=query,
         on_step=_on_step,
-        on_captcha=_on_captcha,
+        on_captcha=_captcha_handler,
         use_vision=use_vision,
     )
+
+    # Cleanup captcha task kalau masih jalan
+    if captcha_task and not captcha_task.done():
+        captcha_task.cancel()
 
     if result.state == AgentState.ERROR:
         console.print(f"\n[bold red]❌ Error:[/] {result.error}")
@@ -91,8 +102,7 @@ async def _run_session(query: str) -> None:
 
     # Rangkuman langkah
     steps_summary = "\n".join(
-        f"- Langkah {s.step}: {s.thought[:60]} → {s.action}"
-        for s in result.steps
+        f"- Langkah {s.step}: {s.thought[:60]} → {s.action}" for s in result.steps
     )
 
     # Rangkum jawaban
@@ -106,7 +116,9 @@ async def _run_session(query: str) -> None:
     console.print("[bold cyan]🔊 Membuat audio...[/]")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     try:
-        audio_path = await text_to_speech(answer, filename=f"jawaban_{timestamp}.mp3")
+        audio_path = await text_to_speech(
+            answer, filename=f"jawaban_{timestamp}.mp3"
+        )
         console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
         play_audio(audio_path)
     except Exception as exc:
@@ -130,28 +142,33 @@ def main() -> None:
         sys.exit(1)
 
     console.print(
-        f"[dim]Provider aktif: "
-        f"{', '.join(p.name for p in providers)}[/]\n"
+        f"[dim]Provider aktif: " f"{', '.join(p.name for p in providers)}[/]\n"
     )
 
     # Loop interaktif
-    while True:
+    try:
+        while True:
+            try:
+                query = Prompt.ask("[bold cyan]Tanya[/]")
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Bye! 👋[/]")
+                break
+
+            query = query.strip()
+            if not query:
+                continue
+            if query.lower() in ("exit", "quit", "keluar"):
+                console.print("[dim]Bye! 👋[/]")
+                break
+
+            asyncio.run(_run_session(query))
+    finally:
+        # Cleanup shared HTTP client
         try:
-            query = Prompt.ask("[bold cyan]Tanya[/]")
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Bye! 👋[/]")
-            break
-
-        query = query.strip()
-        if not query:
-            continue
-        if query.lower() in ("exit", "quit", "keluar"):
-            console.print("[dim]Bye! 👋[/]")
-            break
-
-        asyncio.run(_run_session(query))
+            asyncio.run(close_client())
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
     main()
-
