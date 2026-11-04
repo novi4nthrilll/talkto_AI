@@ -64,7 +64,7 @@ _JS_EXTRACT_AND_TAG = """
     let idCounter = 0;
 
     for (const el of candidates) {
-        if (idCounter >= 50) break;
+        if (idCounter >= 25) break;
 
         // Abaikan elemen tersembunyi
         const style = window.getComputedStyle(el);
@@ -139,7 +139,7 @@ class AgentResult:
 
 
 # ── Helper ──────────────────────────────────────────────────
-def _clean_html(html: str, max_chars: int = 6000) -> str:
+def _clean_html(html: str, max_chars: int = 2000) -> str:
     """Strip HTML jadi teks inti, batasi panjang untuk hemat token."""
     soup = BeautifulSoup(html, "lxml")
 
@@ -479,14 +479,7 @@ class BrowserAgent:
                 start_url, wait_until="domcontentloaded", timeout=30_000
             )
 
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": _AGENT_SYSTEM},
-                {
-                    "role": "user",
-                    "content": f"Tujuan: {goal}\n\nMulai dari: {start_url}",
-                },
-            ]
-
+            history_lines: list[str] = []
             collected_texts: list[str] = []
 
             for step_num in range(1, steps_limit + 1):
@@ -502,15 +495,22 @@ class BrowserAgent:
                     await self._handle_captcha(on_captcha)
                     obs = await self._observe()
 
-                # 3. Think — kirim ke LLM
+                # 3. Think — kirim ke LLM (kompak, hemat token)
+                history_text = (
+                    "\n".join(history_lines[-4:]) if history_lines else "(langkah awal)"
+                )
                 obs_text = (
-                    f"Langkah {step_num}/{steps_limit}\n"
-                    f"URL: {obs['url']}\n\n"
-                    f"=== Teks halaman ===\n{obs['page_text']}\n\n"
-                    f"=== Elemen interaktif ===\n{obs['interactive']}"
+                    f"Tujuan: {goal}\n"
+                    f"Langkah saat ini: {step_num}/{steps_limit}\n"
+                    f"Riwayat langkah sebelumnya:\n{history_text}\n\n"
+                    f"URL Halaman: {obs['url']}\n\n"
+                    f"=== Teks Halaman ===\n{obs['page_text']}\n\n"
+                    f"=== Elemen Interaktif ===\n{obs['interactive']}"
                 )
 
-                messages = _trim_messages(messages)
+                messages: list[dict[str, Any]] = [
+                    {"role": "system", "content": _AGENT_SYSTEM},
+                ]
 
                 if use_vision:
                     screenshot_b64 = await self._take_screenshot()
@@ -525,7 +525,7 @@ class BrowserAgent:
                 action = parsed.get("action", "done")
                 extract = parsed.get("extract", "")
 
-                messages.append({"role": "assistant", "content": response})
+                history_lines.append(f"- Langkah {step_num}: {thought[:60]} → {action}")
 
                 step_res = StepResult(
                     step=step_num,

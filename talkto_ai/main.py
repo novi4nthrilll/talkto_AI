@@ -22,6 +22,7 @@ from rich.text import Text
 from .browser_agent import AgentState, BrowserAgent, StepResult
 from .config import config
 from .llm import close_client
+from .router import route_user_input
 from .summarizer import summarize
 from .tts import play_audio, text_to_speech
 
@@ -76,8 +77,40 @@ async def _run_session(
     headless: bool | None = None,
     max_steps: int | None = None,
 ) -> None:
-    """Jalankan satu sesi pencarian."""
-    console.print(f"\n[bold green]🔍 Mencari:[/] {query}\n")
+    """Jalankan satu sesi: analisis intensi dulu, baru buka browser jika butuh info web."""
+    console.print(f"\n[bold green]💬 Input:[/] {query}")
+
+    # 1. Analisis intensi pesan pengguna
+    with console.status("[bold cyan]Memahami maksud kamu...[/]"):
+        try:
+            decision = await route_user_input(query)
+        except Exception as exc:
+            log.warning("Gagal routing intent: %s", exc)
+            decision = None
+
+    # Jika percakapan santai / pertanyaan umum -> Langsung jawab tanpa browser
+    if decision and not decision.need_browser and decision.direct_reply:
+        answer = decision.direct_reply
+        console.print(Panel(answer, title="💬 Jawaban", border_style="cyan"))
+
+        if with_audio:
+            console.print("[bold cyan]🔊 Membuat audio...[/]")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            try:
+                audio_path = await text_to_speech(
+                    answer, filename=f"jawaban_{timestamp}.mp3"
+                )
+                console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
+                play_audio(audio_path)
+            except Exception as exc:
+                console.print(f"[yellow]⚠️  Gagal buat audio: {exc}[/]")
+
+        console.print()
+        return
+
+    # 2. Butuh pencarian di internet -> Buka browser agent
+    target_query = (decision.search_query if decision and decision.search_query else query)
+    console.print(f"[bold yellow]🌐 Butuh info web, membuka browser untuk:[/] {target_query}\n")
 
     agent = BrowserAgent(headless=headless)
 
@@ -90,7 +123,7 @@ async def _run_session(
 
     use_vision = bool(config.available_providers(vision=True))
     result = await agent.run(
-        goal=query,
+        goal=target_query,
         on_step=_on_step,
         on_captcha=_captcha_handler,
         use_vision=use_vision,
