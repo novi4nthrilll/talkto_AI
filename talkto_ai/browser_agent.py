@@ -289,9 +289,19 @@ class BrowserAgent:
     async def start(self) -> None:
         """Buka browser."""
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(
-            headless=self.headless,
-        )
+        try:
+            self._browser = await self._pw.chromium.launch(
+                headless=self.headless,
+            )
+        except Exception as exc:
+            err_msg = str(exc)
+            if "Executable doesn't exist" in err_msg or "playwright install" in err_msg:
+                raise RuntimeError(
+                    "Browser Chromium belum di-download oleh Playwright.\n"
+                    "👉 Silakan jalankan perintah ini di terminal kamu:\n\n"
+                    "    playwright install chromium\n"
+                ) from None
+            raise
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(

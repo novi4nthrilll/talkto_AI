@@ -41,12 +41,13 @@ def _build_providers() -> list[LLMProvider]:
     # --- Google Gemini (via OpenAI compat endpoint) ---
     gemini_key = os.getenv("GEMINI_API_KEY", "")
     if gemini_key:
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
         providers.append(
             LLMProvider(
                 name="gemini",
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai",
                 api_key=gemini_key,
-                model="gemini-2.0-flash",
+                model=gemini_model,
                 supports_vision=True,
             )
         )
@@ -54,12 +55,13 @@ def _build_providers() -> list[LLMProvider]:
     # --- Groq ---
     groq_key = os.getenv("GROQ_API_KEY", "")
     if groq_key:
+        groq_model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
         providers.append(
             LLMProvider(
                 name="groq",
                 base_url="https://api.groq.com/openai/v1",
                 api_key=groq_key,
-                model="llama-3.3-70b-versatile",
+                model=groq_model,
                 supports_vision=False,
             )
         )
@@ -67,12 +69,13 @@ def _build_providers() -> list[LLMProvider]:
     # --- OpenRouter (model gratis) ---
     or_key = os.getenv("OPENROUTER_API_KEY", "")
     if or_key:
+        or_model = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
         providers.append(
             LLMProvider(
                 name="openrouter",
                 base_url="https://openrouter.ai/api/v1",
                 api_key=or_key,
-                model="google/gemini-2.0-flash-exp:free",
+                model=or_model,
                 supports_vision=True,
             )
         )

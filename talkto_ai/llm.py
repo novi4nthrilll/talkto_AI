@@ -17,24 +17,34 @@ log = logging.getLogger(__name__)
 # Timeout per request (detik)
 _TIMEOUT = 60.0
 
-# Shared client — dibuat sekali, dipakai berulang supaya koneksi di-reuse
+# Shared client — terikat ke event loop yang aktif
 _client: httpx.AsyncClient | None = None
+_client_loop: asyncio.AbstractEventLoop | None = None
 
 
 async def _get_client() -> httpx.AsyncClient:
-    """Ambil atau buat shared async HTTP client."""
-    global _client
-    if _client is None or _client.is_closed:
+    """Ambil atau buat shared async HTTP client yang terikat ke running event loop."""
+    global _client, _client_loop
+    import asyncio
+    current_loop = asyncio.get_running_loop()
+    if _client is None or _client.is_closed or _client_loop != current_loop:
+        if _client is not None and not _client.is_closed:
+            try:
+                await _client.aclose()
+            except Exception:
+                pass
         _client = httpx.AsyncClient(timeout=_TIMEOUT)
+        _client_loop = current_loop
     return _client
 
 
 async def close_client() -> None:
     """Tutup shared client. Panggil saat shutdown."""
-    global _client
+    global _client, _client_loop
     if _client is not None and not _client.is_closed:
         await _client.aclose()
         _client = None
+        _client_loop = None
 
 
 class LLMError(Exception):
@@ -106,7 +116,8 @@ async def chat(
                 prov, messages, temperature=temperature, max_tokens=max_tokens
             )
         except httpx.HTTPStatusError as exc:
-            msg = f"{prov.name}: HTTP {exc.response.status_code}"
+            detail = exc.response.text.strip()[:200]
+            msg = f"{prov.name}: HTTP {exc.response.status_code} ({detail})"
             log.warning("Gagal: %s", msg)
             errors.append(msg)
             # Retry sekali untuk error 429 (rate limit) dan 5xx

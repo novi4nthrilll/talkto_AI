@@ -158,6 +158,34 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+async def _interactive_loop(
+    with_audio: bool = True,
+    headless: bool | None = None,
+    max_steps: int | None = None,
+) -> None:
+    """Loop prompt interaktif di dalam satu event loop."""
+    while True:
+        try:
+            query = await asyncio.to_thread(Prompt.ask, "[bold cyan]Tanya[/]")
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Bye! 👋[/]")
+            break
+
+        query = query.strip()
+        if not query:
+            continue
+        if query.lower() in ("exit", "quit", "keluar"):
+            console.print("[dim]Bye! 👋[/]")
+            break
+
+        await _run_session(
+            query,
+            with_audio=with_audio,
+            headless=headless,
+            max_steps=max_steps,
+        )
+
+
 def main() -> None:
     """Entry point CLI."""
     args = parse_args()
@@ -179,9 +207,8 @@ def main() -> None:
     with_audio = not args.no_audio
     headless = True if args.headless else None
 
-    # Jika user memberikan query langsung di command line
-    if args.query:
-        try:
+    try:
+        if args.query:
             asyncio.run(
                 _run_session(
                     args.query,
@@ -190,32 +217,9 @@ def main() -> None:
                     max_steps=args.steps,
                 )
             )
-        finally:
-            try:
-                asyncio.run(close_client())
-            except Exception:
-                pass
-        return
-
-    # Mode prompt interaktif
-    try:
-        while True:
-            try:
-                query = Prompt.ask("[bold cyan]Tanya[/]")
-            except (KeyboardInterrupt, EOFError):
-                console.print("\n[dim]Bye! 👋[/]")
-                break
-
-            query = query.strip()
-            if not query:
-                continue
-            if query.lower() in ("exit", "quit", "keluar"):
-                console.print("[dim]Bye! 👋[/]")
-                break
-
+        else:
             asyncio.run(
-                _run_session(
-                    query,
+                _interactive_loop(
                     with_audio=with_audio,
                     headless=headless,
                     max_steps=args.steps,
