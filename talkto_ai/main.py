@@ -2,10 +2,12 @@
 Main — entry point AI Web Agent.
 
 Alur: perintah pengguna → browser agent → rangkuman → teks + suara.
+Mendukung eksekusi langsung via argument atau mode interaktif.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -62,37 +64,39 @@ def _on_captcha(message: str) -> None:
 async def _wait_for_captcha_input(agent: BrowserAgent) -> None:
     """
     Tunggu input Enter dari user di thread terpisah saat captcha muncul.
-    Pakai asyncio.to_thread supaya tidak block event loop.
     """
     await asyncio.to_thread(input)
     agent.resume_after_captcha()
 
 
-async def _run_session(query: str) -> None:
+async def _run_session(
+    query: str,
+    *,
+    with_audio: bool = True,
+    headless: bool | None = None,
+    max_steps: int | None = None,
+) -> None:
     """Jalankan satu sesi pencarian."""
     console.print(f"\n[bold green]🔍 Mencari:[/] {query}\n")
 
-    agent = BrowserAgent()
+    agent = BrowserAgent(headless=headless)
 
-    # Task untuk handle captcha input secara async
     captcha_task: asyncio.Task | None = None
 
     def _captcha_handler(message: str) -> None:
         nonlocal captcha_task
         _on_captcha(message)
-        # Spawn async task untuk tunggu Enter, bukan thread biasa
         captcha_task = asyncio.create_task(_wait_for_captcha_input(agent))
 
-    # Jalankan agent
     use_vision = bool(config.available_providers(vision=True))
     result = await agent.run(
         goal=query,
         on_step=_on_step,
         on_captcha=_captcha_handler,
         use_vision=use_vision,
+        max_steps=max_steps,
     )
 
-    # Cleanup captcha task kalau masih jalan
     if captcha_task and not captcha_task.done():
         captcha_task.cancel()
 
@@ -100,39 +104,66 @@ async def _run_session(query: str) -> None:
         console.print(f"\n[bold red]❌ Error:[/] {result.error}")
         return
 
-    # Rangkuman langkah
     steps_summary = "\n".join(
         f"- Langkah {s.step}: {s.thought[:60]} → {s.action}" for s in result.steps
     )
 
-    # Rangkum jawaban
     console.print("\n[bold cyan]📝 Merangkum jawaban...[/]")
     answer = await summarize(query, result.collected_text, steps_summary)
 
-    # Tampilkan jawaban
     console.print(Panel(answer, title="💬 Jawaban", border_style="green"))
 
-    # Text-to-Speech
-    console.print("[bold cyan]🔊 Membuat audio...[/]")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    try:
-        audio_path = await text_to_speech(
-            answer, filename=f"jawaban_{timestamp}.mp3"
-        )
-        console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
-        play_audio(audio_path)
-    except Exception as exc:
-        console.print(f"[yellow]⚠️  Gagal buat audio: {exc}[/]")
+    if with_audio:
+        console.print("[bold cyan]🔊 Membuat audio...[/]")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            audio_path = await text_to_speech(
+                answer, filename=f"jawaban_{timestamp}.mp3"
+            )
+            console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
+            play_audio(audio_path)
+        except Exception as exc:
+            console.print(f"[yellow]⚠️  Gagal buat audio: {exc}[/]")
 
     console.print()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="talkto",
+        description="AI Web Agent — Cari info di internet lewat browser, jawab teks & suara.",
+    )
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default=None,
+        help="Pertanyaan / tugas untuk dicari langsung (tanpa prompt interaktif)",
+    )
+    parser.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Jangan buat output audio (hanya teks)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Jalankan browser tanpa jendela (headless)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Batas maksimal langkah browsing agent (override config)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     """Entry point CLI."""
+    args = parse_args()
     _setup_logging()
     _print_banner()
 
-    # Cek provider
     providers = config.available_providers()
     if not providers:
         console.print(
@@ -145,7 +176,28 @@ def main() -> None:
         f"[dim]Provider aktif: " f"{', '.join(p.name for p in providers)}[/]\n"
     )
 
-    # Loop interaktif
+    with_audio = not args.no_audio
+    headless = True if args.headless else None
+
+    # Jika user memberikan query langsung di command line
+    if args.query:
+        try:
+            asyncio.run(
+                _run_session(
+                    args.query,
+                    with_audio=with_audio,
+                    headless=headless,
+                    max_steps=args.steps,
+                )
+            )
+        finally:
+            try:
+                asyncio.run(close_client())
+            except Exception:
+                pass
+        return
+
+    # Mode prompt interaktif
     try:
         while True:
             try:
@@ -161,9 +213,15 @@ def main() -> None:
                 console.print("[dim]Bye! 👋[/]")
                 break
 
-            asyncio.run(_run_session(query))
+            asyncio.run(
+                _run_session(
+                    query,
+                    with_audio=with_audio,
+                    headless=headless,
+                    max_steps=args.steps,
+                )
+            )
     finally:
-        # Cleanup shared HTTP client
         try:
             asyncio.run(close_client())
         except Exception:

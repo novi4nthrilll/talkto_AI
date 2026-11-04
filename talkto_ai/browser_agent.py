@@ -1,6 +1,6 @@
 """
 Modul Browser Agent — observe → think → act loop dengan Playwright.
-Termasuk deteksi captcha dan mekanisme pause/resume.
+Termasuk deteksi captcha akurat dan mekanisme pause/resume.
 """
 
 from __future__ import annotations
@@ -22,25 +22,92 @@ from .llm import build_user_message, chat, encode_screenshot
 log = logging.getLogger(__name__)
 
 
-# ── Konstanta ───────────────────────────────────────────────
-_CAPTCHA_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"captcha", re.I),
-    re.compile(r"verify you are human", re.I),
-    re.compile(r"i('|')m not a robot", re.I),
-    re.compile(r"are you a robot", re.I),
-    re.compile(r"security check", re.I),
-    re.compile(r"challenge-platform", re.I),
-    re.compile(r"hcaptcha", re.I),
-    re.compile(r"recaptcha", re.I),
-    re.compile(r"cf-turnstile", re.I),
+# ── Konstanta & Pola Captcha ───────────────────────────────
+_CAPTCHA_FRAMES = [
+    "iframe[src*='recaptcha']",
+    "iframe[src*='hcaptcha']",
+    "iframe[src*='turnstile']",
+    "iframe[src*='challenge']",
 ]
 
-# Selector gabungan — satu daftar untuk klik DAN type, supaya indeks konsisten
-_INTERACTIVE_SELECTOR = (
-    "a, button, input, textarea, select, "
-    "[role=button], [role=link], [role=textbox], "
-    "[contenteditable=true], input[type=submit]"
-)
+_CAPTCHA_SELECTORS = [
+    "#challenge-running",
+    "#cf-turnstile",
+    ".cf-turnstile-wrapper",
+    "#captcha",
+    ".g-recaptcha",
+    ".h-captcha",
+    "#challenge-stage",
+    "form#challenge-form",
+]
+
+_CAPTCHA_TEXT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"verify you are human", re.I),
+    re.compile(r"i('?|’)m not a robot", re.I),
+    re.compile(r"confirm you are human", re.I),
+    re.compile(r"checking your browser before accessing", re.I),
+    re.compile(r"enable javascript and cookies to continue", re.I),
+    re.compile(r"attention required! \| cloudflare", re.I),
+    re.compile(r"just a moment\.\.\.", re.I),
+]
+
+# Script JavaScript untuk menandai elemen interaktif langsung di DOM browser
+# Menghindari ketidakcocokan indeks antara observe dan action
+_JS_EXTRACT_AND_TAG = """
+() => {
+    const selector = 'a, button, input, textarea, select, [role=button], [role=link], [role=textbox], [contenteditable=true]';
+    // Hapus tanda data-talkto-id lama jika ada
+    document.querySelectorAll('[data-talkto-id]').forEach(el => el.removeAttribute('data-talkto-id'));
+
+    const candidates = Array.from(document.querySelectorAll(selector));
+    const items = [];
+    let idCounter = 0;
+
+    for (const el of candidates) {
+        if (idCounter >= 50) break;
+
+        // Abaikan elemen tersembunyi
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+
+        el.setAttribute('data-talkto-id', String(idCounter));
+
+        const tag = el.tagName.toLowerCase();
+        const type = el.getAttribute('type') || '';
+        const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+        const placeholder = el.getAttribute('placeholder') || '';
+        const ariaLabel = el.getAttribute('aria-label') || '';
+        const href = el.getAttribute('href') || '';
+        const val = el.value || '';
+
+        const labelParts = [];
+        if (text) labelParts.push(text);
+        else if (placeholder) labelParts.push(`placeholder="${placeholder}"`);
+        else if (ariaLabel) labelParts.push(`aria-label="${ariaLabel}"`);
+        else if (val) labelParts.push(`val="${val.slice(0, 30)}"`);
+
+        const label = labelParts.join(' ') || '(tanpa teks)';
+
+        let desc = `[${idCounter}] <${tag}`;
+        if (type) desc += ` type="${type}"`;
+        desc += `> ${label}`;
+
+        if (tag === 'input' || tag === 'textarea' || el.getAttribute('contenteditable') === 'true') {
+            desc += ' [BISA DIKETIK]';
+        } else if (tag === 'select') {
+            desc += ' [DROPDOWN]';
+        } else if (href) {
+            desc += ` → ${href.slice(0, 60)}`;
+        }
+
+        items.push(desc);
+        idCounter++;
+    }
+    return items.join('\\n');
+}
+"""
 
 
 class AgentState(Enum):
@@ -76,7 +143,6 @@ def _clean_html(html: str, max_chars: int = 6000) -> str:
     """Strip HTML jadi teks inti, batasi panjang untuk hemat token."""
     soup = BeautifulSoup(html, "lxml")
 
-    # Buang elemen yang tidak berguna
     for tag in soup(
         ["script", "style", "nav", "footer", "header", "noscript", "svg", "iframe"]
     ):
@@ -90,63 +156,42 @@ def _clean_html(html: str, max_chars: int = 6000) -> str:
     return cleaned
 
 
-def _detect_captcha(page_text: str, page_url: str) -> bool:
-    """Cek apakah halaman mengandung indikasi captcha."""
-    combined = page_text + " " + page_url
-    return any(pat.search(combined) for pat in _CAPTCHA_PATTERNS)
+async def _detect_captcha_page(page: Page) -> bool:
+    """Deteksi captcha lewat DOM dan teks halaman secara akurat."""
+    try:
+        # 1. Cek iframe captcha
+        for frame_sel in _CAPTCHA_FRAMES:
+            frames = await page.query_selector_all(frame_sel)
+            if frames:
+                return True
 
+        # 2. Cek elemen id / class khas captcha
+        for sel in _CAPTCHA_SELECTORS:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                return True
 
-def _extract_interactive_elements(html: str, max_items: int = 50) -> str:
-    """
-    Ambil SEMUA elemen interaktif (link, button, input, textarea, dll)
-    dengan satu selector dan satu set indeks — supaya konsisten
-    antara observe dan act.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    items: list[str] = []
+        # 3. Cek judul halaman
+        title = await page.title()
+        if any(
+            p.search(title)
+            for p in [
+                re.compile(r"just a moment", re.I),
+                re.compile(r"attention required", re.I),
+                re.compile(r"recaptcha", re.I),
+                re.compile(r"cloudflare", re.I),
+            ]
+        ):
+            return True
 
-    for i, el in enumerate(soup.select(_INTERACTIVE_SELECTOR)):
-        if i >= max_items:
-            break
-
-        tag = el.name
-        el_type = el.get("type", "")
-        text = el.get_text(strip=True)[:80] or ""
-        placeholder = el.get("placeholder", "")
-        href = el.get("href", "")
-        name = el.get("name", "")
-        aria_label = el.get("aria-label", "")
-        value = el.get("value", "")
-
-        # Bangun label yang informatif
-        label_parts: list[str] = []
-        if text:
-            label_parts.append(text)
-        elif placeholder:
-            label_parts.append(f'placeholder="{placeholder}"')
-        elif aria_label:
-            label_parts.append(f'aria-label="{aria_label}"')
-        elif value:
-            label_parts.append(f'value="{value}"')
-        elif name:
-            label_parts.append(f'name="{name}"')
-        else:
-            label_parts.append("(kosong)")
-
-        label = " ".join(label_parts)
-
-        # Tentukan tipe elemen
-        if tag in ("input", "textarea") or el.get("contenteditable") == "true":
-            kind = f"<{tag}" + (f' type="{el_type}"' if el_type else "") + ">"
-            items.append(f"[{i}] {kind} {label} [BISA DIKETIK]")
-        elif tag == "select":
-            items.append(f"[{i}] <select> {label} [DROPDOWN]")
-        elif href:
-            items.append(f"[{i}] <{tag}> {label} → {href}")
-        else:
-            items.append(f"[{i}] <{tag}> {label}")
-
-    return "\n".join(items) if items else "(tidak ada elemen interaktif)"
+        # 4. Cek teks spesifik di body
+        body_text = await page.evaluate(
+            "() => document.body ? document.body.innerText.slice(0, 3000) : ''"
+        )
+        return any(pat.search(body_text) for pat in _CAPTCHA_TEXT_PATTERNS)
+    except Exception as exc:
+        log.debug("Cek captcha gagal: %s", exc)
+        return False
 
 
 def _trim_messages(
@@ -157,7 +202,7 @@ def _trim_messages(
 ) -> list[dict[str, Any]]:
     """
     Batasi panjang history messages supaya tidak melebihi token limit.
-    Simpan system prompt + beberapa langkah terakhir.
+    Simpan system prompt + instruksi awal + beberapa langkah terakhir.
     """
     system_msgs = [m for m in messages if m.get("role") == "system"]
     non_system = [m for m in messages if m.get("role") != "system"]
@@ -165,9 +210,8 @@ def _trim_messages(
     if len(non_system) <= keep_recent:
         return messages
 
-    # Ambil pesan pertama (tujuan awal) + pesan terbaru
     trimmed = system_msgs[:keep_system]
-    trimmed.append(non_system[0])  # Tujuan awal
+    trimmed.append(non_system[0])
     trimmed.append(
         {
             "role": "user",
@@ -185,7 +229,7 @@ Kamu adalah browser agent. Tugasmu: navigasi web untuk mencapai tujuan user.
 Di setiap langkah kamu akan diberi:
 - URL halaman sekarang
 - Teks inti halaman
-- Daftar elemen interaktif (dengan indeks)
+- Daftar elemen interaktif (dengan indeks [id])
   - Elemen bertanda [BISA DIKETIK] bisa diisi teks pakai `type`
   - Elemen lain bisa diklik pakai `click`
 
@@ -198,9 +242,9 @@ Jawab **hanya** dengan satu blok JSON (tanpa markdown fence):
 
 Aturan:
 - `goto <url>` — buka halaman baru.
-- `click <indeks>` — klik elemen berdasarkan indeks.
-- `type <indeks> <teks>` — ketik di elemen [BISA DIKETIK] berdasarkan indeks.
-- `press_enter` — tekan Enter (misal setelah mengetik query di search box).
+- `click <indeks>` — klik elemen berdasarkan indeks [id].
+- `type <indeks> <teks>` — ketik di elemen [BISA DIKETIK] berdasarkan indeks [id].
+- `press_enter` — tekan Enter pada keyboard (misal setelah mengetik query di search bar).
 - `scroll down` / `scroll up` — scroll halaman.
 - `extract` — ambil informasi penting dari halaman saat ini.
 - `done` — tujuan tercapai atau info sudah cukup.
@@ -213,15 +257,14 @@ Aturan:
 def _parse_agent_response(text: str) -> dict[str, str]:
     """Parse JSON dari respons agent, toleran terhadap markdown fences."""
     text = text.strip()
-    # Hapus markdown code fence jika ada
     if text.startswith("```"):
         text = re.sub(r"^```\w*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
     try:
         return _json.loads(text)
     except _json.JSONDecodeError:
-        # Coba cari JSON di dalam teks
-        match = re.search(r"\{.*\}", text, re.DOTALL)
+        # Coba ambil objek JSON pertama yang valid
+        match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
         if match:
             try:
                 return _json.loads(match.group())
@@ -234,7 +277,8 @@ def _parse_agent_response(text: str) -> dict[str, str]:
 class BrowserAgent:
     """Agent yang mengendalikan browser untuk mencari informasi."""
 
-    def __init__(self) -> None:
+    def __init__(self, headless: bool | None = None) -> None:
+        self.headless = headless if headless is not None else config.browser_headless
         self._pw = None
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
@@ -246,7 +290,7 @@ class BrowserAgent:
         """Buka browser."""
         self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
-            headless=config.browser_headless,
+            headless=self.headless,
         )
         self._context = await self._browser.new_context(
             viewport={"width": 1280, "height": 800},
@@ -257,7 +301,7 @@ class BrowserAgent:
             ),
         )
         self._page = await self._context.new_page()
-        log.info("Browser dimulai (headless=%s)", config.browser_headless)
+        log.info("Browser dimulai (headless=%s)", self.headless)
 
     async def stop(self) -> None:
         """Tutup browser."""
@@ -268,27 +312,39 @@ class BrowserAgent:
         log.info("Browser ditutup")
 
     async def _observe(self) -> dict[str, str]:
-        """Ambil kondisi halaman saat ini."""
-        assert self._page is not None
+        """Ambil kondisi halaman saat ini dan tandai elemen interaktif di DOM."""
+        if self._page is None:
+            raise RuntimeError("Browser belum dimulai.")
+
         url = self._page.url
         html = await self._page.content()
         page_text = _clean_html(html)
-        interactive = _extract_interactive_elements(html)
+
+        # Tag elemen interaktif langsung di DOM browser & dapatkan deskripsinya
+        try:
+            interactive = await self._page.evaluate(_JS_EXTRACT_AND_TAG)
+        except Exception as exc:
+            log.warning("Gagal menandai elemen DOM: %s", exc)
+            interactive = "(gagal membaca elemen interaktif)"
+
         return {
             "url": url,
             "page_text": page_text,
-            "interactive": interactive,
+            "interactive": interactive or "(tidak ada elemen interaktif)",
         }
 
     async def _take_screenshot(self) -> str:
         """Ambil screenshot dan encode ke base64."""
-        assert self._page is not None
+        if self._page is None:
+            raise RuntimeError("Browser belum dimulai.")
         raw = await self._page.screenshot(type="png")
         return encode_screenshot(raw)
 
     async def _execute_action(self, action: str) -> None:
-        """Jalankan aksi dari agent."""
-        assert self._page is not None
+        """Jalankan aksi dari agent menggunakan selector data-talkto-id yang terpasang di DOM."""
+        if self._page is None:
+            raise RuntimeError("Browser belum dimulai.")
+
         parts = action.strip().split(maxsplit=1)
         cmd = parts[0].lower()
         arg = parts[1] if len(parts) > 1 else ""
@@ -298,25 +354,21 @@ class BrowserAgent:
             if not url.startswith("http"):
                 url = "https://" + url
             log.info("→ goto %s", url)
-            try:
-                await self._page.goto(
-                    url, wait_until="domcontentloaded", timeout=30_000
-                )
-            except Exception as exc:
-                log.warning("Gagal goto %s: %s", url, exc)
-                raise
+            await self._page.goto(
+                url, wait_until="domcontentloaded", timeout=30_000
+            )
 
         elif cmd == "click":
             idx = int(arg)
-            elements = await self._page.query_selector_all(_INTERACTIVE_SELECTOR)
-            if 0 <= idx < len(elements):
+            locator = self._page.locator(f'[data-talkto-id="{idx}"]')
+            count = await locator.count()
+            if count > 0:
                 log.info("→ click [%d]", idx)
                 try:
-                    await elements[idx].scroll_into_view_if_needed(timeout=3000)
+                    await locator.first.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
-                    pass  # Kalau gagal scroll, tetap coba klik
-                await elements[idx].click(timeout=5000)
-                # Tunggu navigasi atau perubahan halaman
+                    pass
+                await locator.first.click(timeout=5000)
                 try:
                     await self._page.wait_for_load_state(
                         "domcontentloaded", timeout=10_000
@@ -324,27 +376,24 @@ class BrowserAgent:
                 except Exception:
                     await asyncio.sleep(1)
             else:
-                log.warning(
-                    "Indeks klik %d di luar jangkauan (%d elemen)", idx, len(elements)
-                )
+                log.warning("Elemen dengan id [%d] tidak ditemukan di halaman", idx)
 
         elif cmd == "type":
-            # format: type <idx> <teks>
             type_parts = arg.split(maxsplit=1)
             idx = int(type_parts[0])
             text = type_parts[1] if len(type_parts) > 1 else ""
-            # Pakai selector yang SAMA dengan observe
-            elements = await self._page.query_selector_all(_INTERACTIVE_SELECTOR)
-            if 0 <= idx < len(elements):
+            locator = self._page.locator(f'[data-talkto-id="{idx}"]')
+            count = await locator.count()
+            if count > 0:
                 log.info("→ type [%d] '%s'", idx, text[:40])
                 try:
-                    await elements[idx].scroll_into_view_if_needed(timeout=3000)
+                    await locator.first.scroll_into_view_if_needed(timeout=3000)
                 except Exception:
                     pass
-                await elements[idx].click(timeout=3000)
-                await elements[idx].fill(text)
+                await locator.first.click(timeout=3000)
+                await locator.first.fill(text)
             else:
-                log.warning("Indeks type %d di luar jangkauan (%d elemen)", idx, len(elements))
+                log.warning("Elemen dengan id [%d] tidak ditemukan untuk type", idx)
 
         elif cmd == "press_enter":
             log.info("→ press Enter")
@@ -364,26 +413,31 @@ class BrowserAgent:
             await asyncio.sleep(0.5)
 
         elif cmd in ("extract", "done"):
-            pass  # Tidak ada aksi browser
+            pass
 
         else:
             log.warning("Aksi tidak dikenali: %s", action)
 
-    async def _handle_captcha(self, on_captcha) -> None:
-        """Pause dan tunggu pengguna menyelesaikan captcha."""
+    async def _handle_captcha(self, on_captcha, timeout_seconds: float = 300.0) -> None:
+        """Pause dan tunggu pengguna menyelesaikan captcha dengan batas waktu."""
         self.state = AgentState.PAUSED_CAPTCHA
         self._captcha_event.clear()
 
         if on_captcha:
             on_captcha(
                 "⚠️  CAPTCHA terdeteksi! Selesaikan di browser, "
-                "lalu tekan Enter di terminal."
+                "lalu tekan Enter di terminal (batas waktu 5 menit)."
             )
 
         log.info("Agent di-pause — menunggu captcha diselesaikan...")
-        await self._captcha_event.wait()
-        self.state = AgentState.RUNNING
-        log.info("Captcha diselesaikan — melanjutkan agent")
+        try:
+            await asyncio.wait_for(self._captcha_event.wait(), timeout=timeout_seconds)
+            self.state = AgentState.RUNNING
+            log.info("Captcha diselesaikan — melanjutkan agent")
+        except asyncio.TimeoutError:
+            log.warning("Timeout menunggu penyelesaian captcha.")
+            self.state = AgentState.ERROR
+            raise RuntimeError("Waktu menunggu penyelesaian captcha habis (5 menit).")
 
     def resume_after_captcha(self) -> None:
         """Dipanggil setelah pengguna menyelesaikan captcha."""
@@ -397,24 +451,20 @@ class BrowserAgent:
         on_step=None,
         on_captcha=None,
         use_vision: bool = False,
+        max_steps: int | None = None,
     ) -> AgentResult:
         """
         Jalankan agent loop observe → think → act.
-
-        Parameters
-        ----------
-        goal : tujuan pencarian
-        start_url : URL awal
-        on_step : callback(StepResult) tiap langkah
-        on_captcha : callback(str) saat captcha terdeteksi
-        use_vision : pakai screenshot (butuh model vision)
         """
+        steps_limit = max_steps or config.max_steps
         result = AgentResult(goal=goal)
         self.state = AgentState.RUNNING
 
         try:
             await self.start()
-            assert self._page is not None
+            if self._page is None:
+                raise RuntimeError("Gagal menginisialisasi browser page.")
+
             await self._page.goto(
                 start_url, wait_until="domcontentloaded", timeout=30_000
             )
@@ -429,24 +479,27 @@ class BrowserAgent:
 
             collected_texts: list[str] = []
 
-            for step_num in range(1, config.max_steps + 1):
-                # 1. Observe
+            for step_num in range(1, steps_limit + 1):
+                # 1. Cek captcha sebelum observe
+                if await _detect_captcha_page(self._page):
+                    await self._handle_captcha(on_captcha)
+
+                # 2. Observe (juga memberi tag data-talkto-id ke elemen DOM)
                 obs = await self._observe()
 
-                # 2. Cek captcha
-                if _detect_captcha(obs["page_text"], obs["url"]):
+                # Cek captcha lagi jika muncul setelah refresh
+                if await _detect_captcha_page(self._page):
                     await self._handle_captcha(on_captcha)
-                    obs = await self._observe()  # Refresh setelah captcha
+                    obs = await self._observe()
 
                 # 3. Think — kirim ke LLM
                 obs_text = (
-                    f"Langkah {step_num}/{config.max_steps}\n"
+                    f"Langkah {step_num}/{steps_limit}\n"
                     f"URL: {obs['url']}\n\n"
                     f"=== Teks halaman ===\n{obs['page_text']}\n\n"
                     f"=== Elemen interaktif ===\n{obs['interactive']}"
                 )
 
-                # Trim message history supaya tidak melebihi token limit
                 messages = _trim_messages(messages)
 
                 if use_vision:
@@ -483,7 +536,6 @@ class BrowserAgent:
                     action,
                 )
 
-                # Kumpulkan teks yang di-extract
                 if extract:
                     collected_texts.append(extract)
 
@@ -503,7 +555,7 @@ class BrowserAgent:
                         }
                     )
 
-                await asyncio.sleep(1)  # Jeda antar langkah
+                await asyncio.sleep(1)
 
             result.collected_text = "\n\n---\n\n".join(collected_texts)
             result.state = AgentState.DONE
