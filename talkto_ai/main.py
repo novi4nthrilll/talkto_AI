@@ -100,7 +100,10 @@ async def _run_session(
                 audio_path = await text_to_speech(
                     answer, filename=f"jawaban_{timestamp}.mp3"
                 )
-                console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
+                if config.auto_delete_audio:
+                    console.print("[green]✅ Memutar suara (otomatis dihapus setelah selesai)...[/]")
+                else:
+                    console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
                 play_audio(audio_path)
             except Exception as exc:
                 console.print(f"[yellow]⚠️  Gagal buat audio: {exc}[/]")
@@ -153,7 +156,10 @@ async def _run_session(
             audio_path = await text_to_speech(
                 answer, filename=f"jawaban_{timestamp}.mp3"
             )
-            console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
+            if config.auto_delete_audio:
+                console.print("[green]✅ Memutar suara (otomatis dihapus setelah selesai)...[/]")
+            else:
+                console.print(f"[green]✅ Audio disimpan:[/] {audio_path}")
             play_audio(audio_path)
         except Exception as exc:
             console.print(f"[yellow]⚠️  Gagal buat audio: {exc}[/]")

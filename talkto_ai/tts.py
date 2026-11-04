@@ -8,8 +8,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from .config import config
@@ -132,16 +135,47 @@ async def text_to_speech(
     return output_path
 
 
-def play_audio(path: Path) -> None:
-    """Coba putar file audio. Kalau gagal, print path-nya saja."""
+def _play_and_cleanup_worker(cmd: list[str], path: Path, delete_after: bool) -> None:
+    """Worker background untuk memutar audio lalu menghapus filenya jika diminta."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=(sys.platform == "win32"),
+        )
+        proc.wait()
+    except Exception as exc:
+        log.warning("Gagal memutar audio dengan %s: %s", cmd[0], exc)
+    finally:
+        if delete_after:
+            try:
+                # Beri sedikit jeda agar process benar-benar melepaskan file handle
+                time.sleep(0.5)
+                if path.exists():
+                    path.unlink()
+                    log.info("File audio dihapus permanen: %s", path)
+            except Exception as exc:
+                log.debug("Gagal menghapus file audio %s: %s", path, exc)
+
+
+def play_audio(path: Path, delete_after: bool | None = None) -> None:
+    """
+    Putar file audio secara otomatis di background.
+    Jika delete_after=True (default sesuai config), file dihapus permanen setelah selesai diputar.
+    """
+    if delete_after is None:
+        delete_after = config.auto_delete_audio
+
     players: list[list[str]] = []
 
     if sys.platform == "linux":
-        # Coba player ringan dulu, baru fallback ke xdg-open
+        # Prioritaskan mpg123, mpv, ffplay, paplay, lalu xdg-open
         players = [
+            ["mpg123", "-q", str(path)],
             ["mpv", "--no-video", str(path)],
             ["ffplay", "-nodisp", "-autoexit", str(path)],
-            ["aplay", str(path)],
+            ["paplay", str(path)],
             ["xdg-open", str(path)],
         ]
     elif sys.platform == "darwin":
@@ -150,18 +184,26 @@ def play_audio(path: Path) -> None:
         players = [["start", "", str(path)]]
 
     for cmd in players:
-        try:
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=(sys.platform == "win32"),
-            )
-            return
-        except FileNotFoundError:
+        binary = cmd[0]
+        # Pastikan binary tersedia di sistem
+        if sys.platform != "win32" and not shutil.which(binary):
             continue
+
+        try:
+            thread = threading.Thread(
+                target=_play_and_cleanup_worker,
+                args=(cmd, path, delete_after),
+                daemon=True,
+            )
+            thread.start()
+            return
         except Exception as exc:
-            log.warning("Gagal memutar dengan %s: %s", cmd[0], exc)
+            log.warning("Gagal memulai player %s: %s", binary, exc)
             continue
 
     log.info("Tidak ada audio player yang tersedia. File: %s", path)
+    if delete_after and path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            pass
