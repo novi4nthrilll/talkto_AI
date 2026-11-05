@@ -57,12 +57,14 @@ def _truncate_for_speech(text: str, max_chars: int = 1500) -> str:
 
 # ── Engine: edge-tts ────────────────────────────────────────
 async def _tts_edge(text: str, output_path: Path, voice: str) -> Path:
-    """Generate audio via edge-tts (async)."""
+    """Generate audio via edge-tts dengan pengaturan rate & pitch."""
     import edge_tts
 
-    communicate = edge_tts.Communicate(text, voice)
+    rate = getattr(config, "tts_rate", "+10%")
+    pitch = getattr(config, "tts_pitch", "+0Hz")
+    communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
     await communicate.save(str(output_path))
-    log.info("edge-tts → %s", output_path)
+    log.info("edge-tts (%s, rate=%s) → %s", voice, rate, output_path)
     return output_path
 
 
@@ -80,10 +82,91 @@ async def _tts_gtts(text: str, output_path: Path, _voice: str) -> Path:
     return output_path
 
 
+# ── Engine: ElevenLabs (Paling Luwes & Mirip Manusia) ────────
+async def _tts_elevenlabs(text: str, output_path: Path, voice: str) -> Path:
+    """
+    Generate audio via ElevenLabs API (paling luwes, ekspresif & human-like).
+    Gunakan model eleven_multilingual_v2.
+    """
+    import os
+    import httpx
+
+    api_key = os.getenv("ELEVENLABS_API_KEY", "")
+    if not api_key:
+        raise ValueError(
+            "ELEVENLABS_API_KEY belum diisi di .env! "
+            "Dapatkan key gratis di https://elevenlabs.io"
+        )
+
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "") or (
+        voice if voice and not voice.startswith("id-ID") else "21m00Tcm4TlvDq8ikWAM"
+    )
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": api_key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.8,
+            "style": 0.3,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        output_path.write_bytes(resp.content)
+
+    log.info("elevenlabs (%s) → %s", voice_id, output_path)
+    return output_path
+
+
+# ── Engine: OpenAI TTS ──────────────────────────────────────
+async def _tts_openai(text: str, output_path: Path, voice: str) -> Path:
+    """Generate audio via OpenAI TTS API (tts-1)."""
+    import os
+    import httpx
+
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY belum diisi di .env")
+
+    voice_name = (
+        voice
+        if voice in ("alloy", "echo", "fable", "onyx", "nova", "shimmer")
+        else "nova"
+    )
+    url = "https://api.openai.com/v1/audio/speech"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "tts-1",
+        "input": text,
+        "voice": voice_name,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        output_path.write_bytes(resp.content)
+
+    log.info("openai-tts (%s) → %s", voice_name, output_path)
+    return output_path
+
+
 # ── Dispatcher ──────────────────────────────────────────────
 _ENGINES = {
     "edge-tts": _tts_edge,
     "gtts": _tts_gtts,
+    "elevenlabs": _tts_elevenlabs,
+    "openai": _tts_openai,
 }
 
 

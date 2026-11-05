@@ -107,7 +107,9 @@ class Config:
 
     # TTS
     tts_engine: str = os.getenv("TTS_ENGINE", "edge-tts")
-    tts_voice: str = os.getenv("TTS_VOICE", "id-ID-ArdiNeural")
+    tts_voice: str = os.getenv("TTS_VOICE", "id-ID-GadisNeural")
+    tts_rate: str = os.getenv("TTS_RATE", "+10%")
+    tts_pitch: str = os.getenv("TTS_PITCH", "+0Hz")
     auto_delete_audio: bool = (
         os.getenv("AUTO_DELETE_AUDIO", "true").lower() == "true"
     )
