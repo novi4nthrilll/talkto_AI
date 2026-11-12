@@ -20,7 +20,7 @@ Program berbasis AI yang mencari informasi di internet dengan membuka browser se
 
 ### 1. Clone & Masuk ke Folder
 ```bash
-git clone https://github.com/novi4nth/talkto_AI.git
+git clone https://github.com/novi4nthrilll/talkto_AI.git
 cd talkto_AI
 ```
 
